@@ -1,0 +1,10 @@
+[package]
+name = "extscan"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A small CLI tool that reports file counts and size usage by extension."
+
+[[bin]]
+name = "extscan"
+path = "main.rs"

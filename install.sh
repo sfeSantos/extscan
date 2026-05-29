@@ -3,22 +3,28 @@ set -euo pipefail
 
 APP_NAME="${APP_NAME:-extscan}"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
-SOURCE_FILE="main.rs"
-
-if ! command -v rustc >/dev/null 2>&1; then
-    echo "Error: rustc was not found in PATH."
-    echo "Install Rust first: https://www.rust-lang.org/tools/install"
-    exit 1
-fi
-
-if [ ! -f "$SOURCE_FILE" ]; then
-    echo "Error: $SOURCE_FILE was not found."
-    echo "Run this script from the project directory."
-    exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BINARY_FILE="${SCRIPT_DIR}/${APP_NAME}"
+SOURCE_FILE="${SCRIPT_DIR}/main.rs"
 
 mkdir -p "$INSTALL_DIR"
-rustc "$SOURCE_FILE" -o "${INSTALL_DIR}/${APP_NAME}"
+
+if [ -f "$BINARY_FILE" ]; then
+    cp "$BINARY_FILE" "${INSTALL_DIR}/${APP_NAME}"
+elif [ -f "$SOURCE_FILE" ]; then
+    if ! command -v rustc >/dev/null 2>&1; then
+        echo "Error: rustc was not found in PATH and no prebuilt ${APP_NAME} binary was found."
+        echo "Download a release package with a prebuilt binary or install Rust first."
+        exit 1
+    fi
+
+    rustc "$SOURCE_FILE" -o "${INSTALL_DIR}/${APP_NAME}"
+else
+    echo "Error: neither ${APP_NAME} nor main.rs was found."
+    echo "Run this script from the project directory or from an extracted release package."
+    exit 1
+fi
+
 chmod +x "${INSTALL_DIR}/${APP_NAME}"
 
 echo "Installed ${APP_NAME} at ${INSTALL_DIR}/${APP_NAME}"

@@ -17,38 +17,20 @@ By default, it scans only the directory where the command is executed. Use `--in
 ## Requirements
 
 - Linux
-- Rust compiler (`rustc`)
 
-Check if Rust is installed:
+Rust is required only if you want to build from source. A prebuilt release package can be installed without Rust.
 
-```bash
-rustc --version
-```
+## Install From A Release Package
 
-## Build
-
-Compile the program manually with:
+Download and extract the Linux release package:
 
 ```bash
-rustc main.rs -o extscan
+tar -xzf extscan-linux-x86_64.tar.gz
+cd extscan-linux-x86_64
+bash install.sh
 ```
 
-Run it from the project directory:
-
-```bash
-./extscan
-./extscan --include-sub-dir
-```
-
-## Install For The Current User
-
-Run the installation script:
-
-```bash
-./install.sh
-```
-
-The script compiles `main.rs` and installs the executable at:
+The release package includes a prebuilt `extscan` binary, so the install script only copies it to:
 
 ```text
 ~/.local/bin/extscan
@@ -76,7 +58,49 @@ extscan --include-sub-dir
 To install into a custom directory, set `INSTALL_DIR`:
 
 ```bash
-INSTALL_DIR="$HOME/bin" ./install.sh
+INSTALL_DIR="$HOME/bin" bash install.sh
+```
+
+## Build From Source
+
+Install Rust first, then check if it is available:
+
+```bash
+rustc --version
+cargo --version
+```
+
+Build with Cargo:
+
+```bash
+cargo build --release
+```
+
+Run it from the project directory:
+
+```bash
+./target/release/extscan
+./target/release/extscan --include-sub-dir
+```
+
+You can also compile directly with `rustc`:
+
+```bash
+rustc main.rs -o extscan
+```
+
+## Install From Source
+
+Run the installation script:
+
+```bash
+bash install.sh
+```
+
+When running from the source tree, the script compiles `main.rs` and installs the executable at:
+
+```text
+~/.local/bin/extscan
 ```
 
 ## Usage
@@ -110,6 +134,10 @@ Scope: current directory + subdirectories
 | TOTAL     |    15 | 294.5 KB | 100.0% |
 +-----------+-------+----------+--------+
 ```
+
+## GitHub Actions
+
+The workflow at `.github/workflows/rust.yml` builds the project with Cargo, runs tests, and uploads a Linux `x86_64` release package artifact.
 
 ## Uninstall
 

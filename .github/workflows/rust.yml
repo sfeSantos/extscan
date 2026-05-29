@@ -1,0 +1,40 @@
+name: Rust
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: extscan
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp "target/release/${BIN_NAME}" "dist/${BIN_NAME}"
+          cp README.md LICENSE install.sh dist/
+          chmod +x "dist/${BIN_NAME}" dist/install.sh
+          tar -czf "${BIN_NAME}-linux-x86_64.tar.gz" -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-linux-x86_64
+          path: ${{ env.BIN_NAME }}-linux-x86_64.tar.gz
