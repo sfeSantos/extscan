@@ -135,10 +135,6 @@ Scope: current directory + subdirectories
 +-----------+-------+----------+--------+
 ```
 
-## GitHub Actions
-
-The workflow at `.github/workflows/rust.yml` builds the project with Cargo, runs tests, and uploads a Linux `x86_64` release package artifact.
-
 ## Uninstall
 
 Remove the installed executable:
