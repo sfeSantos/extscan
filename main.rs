@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::thread;
@@ -20,7 +20,7 @@ fn main() -> io::Result<()> {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("Usage: {} [--include-sub-dir]", program_name);
+            eprintln!("Usage: {} [--include-sub-dir] [--no-pager]", program_name);
             std::process::exit(1);
         }
     };
@@ -30,27 +30,26 @@ fn main() -> io::Result<()> {
     let extension_stats = collect_extension_stats(&directory, config.include_sub_dir)?;
     let duration = start.elapsed();
 
-    print_report(
-        &directory,
-        config.include_sub_dir,
-        duration,
-        &extension_stats,
-    );
+    print_report(&directory, &config, duration, &extension_stats);
 
     Ok(())
 }
 
 struct Config {
     include_sub_dir: bool,
+    no_pager: bool,
 }
 
 impl Config {
     fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut include_sub_dir = false;
+        let mut no_pager = false;
 
         for arg in args {
             if arg == "--include-sub-dir" {
                 include_sub_dir = true;
+            } else if arg == "--no-pager" {
+                no_pager = true;
             } else if arg.starts_with("--") {
                 return Err(format!("Unknown argument: {arg}"));
             } else {
@@ -58,7 +57,10 @@ impl Config {
             }
         }
 
-        Ok(Self { include_sub_dir })
+        Ok(Self {
+            include_sub_dir,
+            no_pager,
+        })
     }
 }
 
@@ -259,16 +261,63 @@ struct ReportRow {
     usage: String,
 }
 
+const PAGE_SIZE: usize = 10;
+
 fn print_report(
     directory: &Path,
-    include_sub_dir: bool,
+    config: &Config,
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
 ) {
-    print!(
-        "{}",
-        render_report(directory, include_sub_dir, duration, extension_stats)
+    let use_pager = !config.no_pager
+        && extension_stats.len() > PAGE_SIZE
+        && io::stdout().is_terminal()
+        && io::stdin().is_terminal();
+
+    if !use_pager {
+        print!(
+            "{}",
+            render_report(directory, config.include_sub_dir, duration, extension_stats)
+        );
+        return;
+    }
+
+    let pages = render_report_pages(
+        directory,
+        config.include_sub_dir,
+        duration,
+        extension_stats,
+        Some(PAGE_SIZE),
     );
+    let mut wait_between_pages = true;
+
+    for (index, page) in pages.iter().enumerate() {
+        print!("{page}");
+
+        if index + 1 == pages.len() {
+            break;
+        }
+
+        if wait_between_pages {
+            print!(
+                "page {}/{} · Enter: next · q: quit ",
+                index + 1,
+                pages.len()
+            );
+            let _ = io::stdout().flush();
+
+            let mut input = String::new();
+            match io::stdin().read_line(&mut input) {
+                // EOF or a read error: no way to interact, print the rest.
+                Ok(0) | Err(_) => wait_between_pages = false,
+                Ok(_) => {
+                    if input.trim_start().starts_with(['q', 'Q']) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_report(
@@ -277,6 +326,18 @@ fn render_report(
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
 ) -> String {
+    render_report_pages(directory, include_sub_dir, duration, extension_stats, None)
+        .pop()
+        .unwrap_or_default()
+}
+
+fn render_report_pages(
+    directory: &Path,
+    include_sub_dir: bool,
+    duration: Duration,
+    extension_stats: &HashMap<String, ExtensionStats>,
+    page_size: Option<usize>,
+) -> Vec<String> {
     const COLUMN_GAP: usize = 4;
 
     let total_files: usize = extension_stats.values().map(|stats| stats.files).sum();
@@ -344,39 +405,46 @@ fn render_report(
         "─".repeat(extension_width + files_width + size_width + usage_width + 3 * COLUMN_GAP)
     );
 
-    let mut report = String::new();
-    report.push_str(&format_row("Extension", "Files", "Size", "Usage"));
-    report.push_str(&separator);
+    let total_row = format_row("TOTAL", &total_files.to_string(), &total_size, total_usage);
+    let chunk_size = page_size.unwrap_or(rows.len()).max(1);
+    let mut pages = Vec::new();
 
-    for row in &rows {
-        report.push_str(&format_row(
-            &row.extension,
-            &row.files.to_string(),
-            &row.size,
-            &row.usage,
+    // Every page carries the header and the TOTAL row, so each one reads as a
+    // complete table on its own.
+    for chunk in rows.chunks(chunk_size) {
+        let mut page = String::new();
+        page.push_str(&format_row("Extension", "Files", "Size", "Usage"));
+        page.push_str(&separator);
+
+        for row in chunk {
+            page.push_str(&format_row(
+                &row.extension,
+                &row.files.to_string(),
+                &row.size,
+                &row.usage,
+            ));
+        }
+
+        page.push_str(&separator);
+        page.push_str(&total_row);
+        pages.push(page);
+    }
+
+    if let Some(last_page) = pages.last_mut() {
+        last_page.push('\n');
+        last_page.push_str(&format!(
+            "{} · {} · {}\n",
+            directory.display(),
+            if include_sub_dir {
+                "subdirectories"
+            } else {
+                "current directory"
+            },
+            format_duration(duration)
         ));
     }
 
-    report.push_str(&separator);
-    report.push_str(&format_row(
-        "TOTAL",
-        &total_files.to_string(),
-        &total_size,
-        total_usage,
-    ));
-    report.push('\n');
-    report.push_str(&format!(
-        "{} · {} · {}\n",
-        directory.display(),
-        if include_sub_dir {
-            "subdirectories"
-        } else {
-            "current directory"
-        },
-        format_duration(duration)
-    ));
-
-    report
+    pages
 }
 
 fn format_usage(bytes: u64, total_bytes: u64) -> String {
@@ -555,6 +623,70 @@ TOTAL            3    15 B    100.0%
 /scan/dir · subdirectories · 122ms
 ";
         assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn paginates_large_reports() {
+        let mut stats = HashMap::new();
+        for i in 0..25 {
+            stats.insert(
+                format!("e{i:02}"),
+                ExtensionStats {
+                    files: 1,
+                    bytes: 10,
+                },
+            );
+        }
+
+        let pages = render_report_pages(
+            Path::new("/scan/dir"),
+            true,
+            Duration::from_millis(9),
+            &stats,
+            Some(10),
+        );
+
+        assert_eq!(pages.len(), 3);
+
+        let data_rows = |page: &str| page.lines().filter(|line| line.starts_with('e')).count();
+        assert_eq!(data_rows(&pages[0]), 10);
+        assert_eq!(data_rows(&pages[1]), 10);
+        assert_eq!(data_rows(&pages[2]), 5);
+
+        let rule_len = |page: &str| page.lines().nth(1).unwrap().chars().count();
+        for page in &pages {
+            assert!(page.starts_with("Extension"));
+            assert!(page.contains("TOTAL"));
+            assert_eq!(rule_len(page), rule_len(&pages[0]));
+        }
+
+        assert!(!pages[0].contains('·'));
+        assert!(pages[2].ends_with("/scan/dir · subdirectories · 9ms\n"));
+    }
+
+    #[test]
+    fn small_report_fits_one_page() {
+        let mut stats = HashMap::new();
+        stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 7 });
+
+        let pages = render_report_pages(
+            Path::new("/scan/dir"),
+            false,
+            Duration::from_millis(5),
+            &stats,
+            Some(10),
+        );
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0],
+            render_report(
+                Path::new("/scan/dir"),
+                false,
+                Duration::from_millis(5),
+                &stats
+            )
+        );
     }
 
     #[test]
