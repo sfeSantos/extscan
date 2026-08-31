@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ fn main() -> io::Result<()> {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("Usage: {} [--include-sub-dir]", program_name);
+            eprintln!("Usage: {} [--include-sub-dir] [--no-pager]", program_name);
             std::process::exit(1);
         }
     };
@@ -30,27 +31,26 @@ fn main() -> io::Result<()> {
     let extension_stats = collect_extension_stats(&directory, config.include_sub_dir)?;
     let duration = start.elapsed();
 
-    print_report(
-        &directory,
-        config.include_sub_dir,
-        duration,
-        &extension_stats,
-    );
+    print_report(&directory, &config, duration, &extension_stats);
 
     Ok(())
 }
 
 struct Config {
     include_sub_dir: bool,
+    no_pager: bool,
 }
 
 impl Config {
     fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut include_sub_dir = false;
+        let mut no_pager = false;
 
         for arg in args {
             if arg == "--include-sub-dir" {
                 include_sub_dir = true;
+            } else if arg == "--no-pager" {
+                no_pager = true;
             } else if arg.starts_with("--") {
                 return Err(format!("Unknown argument: {arg}"));
             } else {
@@ -58,7 +58,10 @@ impl Config {
             }
         }
 
-        Ok(Self { include_sub_dir })
+        Ok(Self {
+            include_sub_dir,
+            no_pager,
+        })
     }
 }
 
@@ -255,20 +258,200 @@ fn scan_directory(
 struct ReportRow {
     extension: String,
     files: usize,
+    bytes: u64,
     size: String,
     usage: String,
 }
 
+const PAGE_SIZE: usize = 10;
+
 fn print_report(
     directory: &Path,
-    include_sub_dir: bool,
+    config: &Config,
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
 ) {
+    let use_pager = !config.no_pager
+        && extension_stats.len() > PAGE_SIZE
+        && io::stdout().is_terminal()
+        && io::stdin().is_terminal();
+
+    if !use_pager {
+        print!(
+            "{}",
+            render_report(directory, config.include_sub_dir, duration, extension_stats)
+        );
+        return;
+    }
+
+    let pages = render_report_pages(extension_stats, Some(PAGE_SIZE));
+    // Raw mode lets arrow keys work without Enter; when the terminal cannot
+    // be switched (no stty, as on Windows), fall back to line input.
+    let raw_terminal = RawTerminal::enable();
+    let use_arrows = raw_terminal.is_some();
+    let mut stdin = io::stdin();
+    let mut index = 0;
+    let mut erase_lines = 0;
+
+    loop {
+        if erase_lines > 0 {
+            // Move the cursor back over the previous page and its prompt,
+            // then clear downward: the new page replaces the old one instead
+            // of stacking below it.
+            print!("\r\x1b[{erase_lines}A\x1b[J");
+        }
+
+        let page = &pages[index];
+        print!("{page}");
+
+        let is_last = index + 1 == pages.len();
+        if use_arrows {
+            print!(
+                "page {}/{} · \u{2190}/\u{2192}: navigate · q: quit ",
+                index + 1,
+                pages.len()
+            );
+        } else {
+            print!(
+                "page {}/{} · Enter: {} · b: back · q: quit ",
+                index + 1,
+                pages.len(),
+                if is_last { "finish" } else { "next" }
+            );
+        }
+        let _ = io::stdout().flush();
+
+        let key = if use_arrows {
+            read_key(&mut stdin)
+        } else {
+            read_line_key(&mut stdin)
+        };
+
+        match key {
+            PagerKey::Quit => break,
+            PagerKey::Back => index = index.saturating_sub(1),
+            PagerKey::Next => {
+                if is_last {
+                    break;
+                }
+
+                index += 1;
+            }
+        }
+
+        // In raw mode the prompt line gets no echoed newline, so the cursor
+        // is still on it and `\r` above re-covers it; in line mode Enter
+        // moved one line further down.
+        erase_lines = page.lines().count() + usize::from(!use_arrows);
+    }
+
+    if use_arrows {
+        // Clear the prompt line before giving the terminal back.
+        print!("\r\x1b[J");
+    }
+    drop(raw_terminal);
+
     print!(
-        "{}",
-        render_report(directory, include_sub_dir, duration, extension_stats)
+        "\n{}",
+        render_footer(directory, config.include_sub_dir, duration)
     );
+}
+
+enum PagerKey {
+    Next,
+    Back,
+    Quit,
+}
+
+/// Reads one navigation key in raw mode: right arrow or Enter advance, left
+/// arrow goes back, q quits. Arrow keys arrive as the escape sequence
+/// `ESC [ C` (right) or `ESC [ D` (left).
+fn read_key(stdin: &mut io::Stdin) -> PagerKey {
+    let mut byte = [0u8; 1];
+
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(1) => {}
+            // EOF or a read error: no way to interact, stop paging.
+            _ => return PagerKey::Quit,
+        }
+
+        match byte[0] {
+            0x1b => {
+                let mut rest = [0u8; 2];
+                if stdin.read(&mut rest).unwrap_or(0) == 2 && rest[0] == b'[' {
+                    match rest[1] {
+                        b'C' => return PagerKey::Next,
+                        b'D' => return PagerKey::Back,
+                        _ => {}
+                    }
+                }
+            }
+            b'\r' | b'\n' => return PagerKey::Next,
+            b'q' | b'Q' => return PagerKey::Quit,
+            b'b' | b'B' => return PagerKey::Back,
+            _ => {}
+        }
+    }
+}
+
+/// Line-input fallback when raw mode is unavailable: Enter advances, b goes
+/// back, q quits.
+fn read_line_key(stdin: &mut io::Stdin) -> PagerKey {
+    let mut input = String::new();
+
+    match stdin.read_line(&mut input) {
+        // EOF or a read error: no way to interact, stop paging.
+        Ok(0) | Err(_) => PagerKey::Quit,
+        Ok(_) => {
+            let command = input.trim();
+
+            if command.starts_with(['q', 'Q']) {
+                PagerKey::Quit
+            } else if command.starts_with(['b', 'B']) {
+                PagerKey::Back
+            } else {
+                PagerKey::Next
+            }
+        }
+    }
+}
+
+/// Puts the terminal in raw-ish mode (no line buffering, no echo) through
+/// `stty`, restoring the saved state on drop. `None` when stty is missing or
+/// fails, in which case the pager falls back to line input.
+struct RawTerminal {
+    saved_state: String,
+}
+
+impl RawTerminal {
+    fn enable() -> Option<Self> {
+        // `output()` pipes the child's stdin by default; stty needs the real
+        // terminal on stdin to read its state.
+        let saved = Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .ok()?;
+
+        if !saved.status.success() {
+            return None;
+        }
+
+        let saved_state = String::from_utf8(saved.stdout).ok()?.trim().to_string();
+        let status = Command::new("stty")
+            .args(["-icanon", "-echo", "min", "1", "time", "0"])
+            .status()
+            .ok()?;
+
+        status.success().then_some(Self { saved_state })
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        let _ = Command::new("stty").arg(&self.saved_state).status();
+    }
 }
 
 fn render_report(
@@ -277,15 +460,27 @@ fn render_report(
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
 ) -> String {
+    let mut report = render_report_pages(extension_stats, None)
+        .pop()
+        .unwrap_or_default();
+    report.push('\n');
+    report.push_str(&render_footer(directory, include_sub_dir, duration));
+    report
+}
+
+fn render_report_pages(
+    extension_stats: &HashMap<String, ExtensionStats>,
+    page_size: Option<usize>,
+) -> Vec<String> {
     const COLUMN_GAP: usize = 4;
 
-    let total_files: usize = extension_stats.values().map(|stats| stats.files).sum();
     let total_bytes: u64 = extension_stats.values().map(|stats| stats.bytes).sum();
     let mut rows: Vec<ReportRow> = extension_stats
         .iter()
         .map(|(extension, stats)| ReportRow {
             extension: extension.clone(),
             files: stats.files,
+            bytes: stats.bytes,
             size: format_size(stats.bytes),
             usage: format_usage(stats.bytes, total_bytes),
         })
@@ -296,13 +491,32 @@ fn render_report(
         rows.push(ReportRow {
             extension: "(none)".to_string(),
             files: 0,
+            bytes: 0,
             size: "0 B".to_string(),
             usage: "0.0%".to_string(),
         });
     }
 
-    let total_size = format_size(total_bytes);
-    let total_usage = if total_files == 0 { "0.0%" } else { "100.0%" };
+    // One running total per page: the TOTAL row of each page sums what has
+    // been shown up to and including that page, so the last page carries the
+    // grand total.
+    let chunk_size = page_size.unwrap_or(rows.len()).max(1);
+    let mut running_totals = Vec::new();
+    let mut shown_files: usize = 0;
+    let mut shown_bytes: u64 = 0;
+
+    for chunk in rows.chunks(chunk_size) {
+        for row in chunk {
+            shown_files += row.files;
+            shown_bytes += row.bytes;
+        }
+
+        running_totals.push((
+            shown_files.to_string(),
+            format_size(shown_bytes),
+            format_usage(shown_bytes, total_bytes),
+        ));
+    }
 
     let extension_width = rows
         .iter()
@@ -314,23 +528,23 @@ fn render_report(
     let files_width = rows
         .iter()
         .map(|row| row.files.to_string().len())
+        .chain(running_totals.iter().map(|(files, _, _)| files.len()))
         .max()
         .unwrap_or(0)
-        .max(total_files.to_string().len())
         .max("Files".len());
     let size_width = rows
         .iter()
         .map(|row| row.size.len())
+        .chain(running_totals.iter().map(|(_, size, _)| size.len()))
         .max()
         .unwrap_or(0)
-        .max(total_size.len())
         .max("Size".len());
     let usage_width = rows
         .iter()
         .map(|row| row.usage.len())
+        .chain(running_totals.iter().map(|(_, _, usage)| usage.len()))
         .max()
         .unwrap_or(0)
-        .max(total_usage.len())
         .max("Usage".len());
 
     let format_row = |extension: &str, files: &str, size: &str, usage: &str| {
@@ -344,28 +558,34 @@ fn render_report(
         "─".repeat(extension_width + files_width + size_width + usage_width + 3 * COLUMN_GAP)
     );
 
-    let mut report = String::new();
-    report.push_str(&format_row("Extension", "Files", "Size", "Usage"));
-    report.push_str(&separator);
+    let mut pages = Vec::new();
 
-    for row in &rows {
-        report.push_str(&format_row(
-            &row.extension,
-            &row.files.to_string(),
-            &row.size,
-            &row.usage,
-        ));
+    // Every page carries the header and its running TOTAL row, so each one
+    // reads as a complete table on its own.
+    for (chunk, (files, size, usage)) in rows.chunks(chunk_size).zip(&running_totals) {
+        let mut page = String::new();
+        page.push_str(&format_row("Extension", "Files", "Size", "Usage"));
+        page.push_str(&separator);
+
+        for row in chunk {
+            page.push_str(&format_row(
+                &row.extension,
+                &row.files.to_string(),
+                &row.size,
+                &row.usage,
+            ));
+        }
+
+        page.push_str(&separator);
+        page.push_str(&format_row("TOTAL", files, size, usage));
+        pages.push(page);
     }
 
-    report.push_str(&separator);
-    report.push_str(&format_row(
-        "TOTAL",
-        &total_files.to_string(),
-        &total_size,
-        total_usage,
-    ));
-    report.push('\n');
-    report.push_str(&format!(
+    pages
+}
+
+fn render_footer(directory: &Path, include_sub_dir: bool, duration: Duration) -> String {
+    format!(
         "{} · {} · {}\n",
         directory.display(),
         if include_sub_dir {
@@ -374,9 +594,7 @@ fn render_report(
             "current directory"
         },
         format_duration(duration)
-    ));
-
-    report
+    )
 }
 
 fn format_usage(bytes: u64, total_bytes: u64) -> String {
@@ -555,6 +773,71 @@ TOTAL            3    15 B    100.0%
 /scan/dir · subdirectories · 122ms
 ";
         assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn paginates_large_reports() {
+        let mut stats = HashMap::new();
+        for i in 0..25 {
+            stats.insert(
+                format!("e{i:02}"),
+                ExtensionStats {
+                    files: 1,
+                    bytes: 10,
+                },
+            );
+        }
+
+        let pages = render_report_pages(&stats, Some(10));
+
+        assert_eq!(pages.len(), 3);
+
+        let data_rows = |page: &str| page.lines().filter(|line| line.starts_with('e')).count();
+        assert_eq!(data_rows(&pages[0]), 10);
+        assert_eq!(data_rows(&pages[1]), 10);
+        assert_eq!(data_rows(&pages[2]), 5);
+
+        let rule_len = |page: &str| page.lines().nth(1).unwrap().chars().count();
+        for page in &pages {
+            assert!(page.starts_with("Extension"));
+            assert_eq!(rule_len(page), rule_len(&pages[0]));
+            // The footer belongs to the pager, not to any page.
+            assert!(!page.contains('·'));
+        }
+
+        // Each TOTAL row accumulates what has been shown so far.
+        let total_fields = |page: &str| {
+            let line = page.lines().find(|line| line.starts_with("TOTAL")).unwrap();
+            line.split_whitespace()
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(total_fields(&pages[0]), ["10", "100", "B", "40.0%"]);
+        assert_eq!(total_fields(&pages[1]), ["20", "200", "B", "80.0%"]);
+        assert_eq!(total_fields(&pages[2]), ["25", "250", "B", "100.0%"]);
+    }
+
+    #[test]
+    fn small_report_fits_one_page() {
+        let mut stats = HashMap::new();
+        stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 7 });
+
+        let pages = render_report_pages(&stats, Some(10));
+
+        assert_eq!(pages.len(), 1);
+
+        // A single page plus the footer is exactly the unpaged report.
+        let footer = render_footer(Path::new("/scan/dir"), false, Duration::from_millis(5));
+        assert_eq!(
+            format!("{}\n{}", pages[0], footer),
+            render_report(
+                Path::new("/scan/dir"),
+                false,
+                Duration::from_millis(5),
+                &stats
+            )
+        );
     }
 
     #[test]
