@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -284,59 +285,173 @@ fn print_report(
     }
 
     let pages = render_report_pages(extension_stats, Some(PAGE_SIZE));
+    // Raw mode lets arrow keys work without Enter; when the terminal cannot
+    // be switched (no stty, as on Windows), fall back to line input.
+    let raw_terminal = RawTerminal::enable();
+    let use_arrows = raw_terminal.is_some();
+    let mut stdin = io::stdin();
     let mut index = 0;
     let mut erase_lines = 0;
 
     loop {
         if erase_lines > 0 {
-            // Move the cursor back over the previous page and its answered
-            // prompt line, then clear downward: the new page replaces the old
-            // one instead of stacking below it.
-            print!("\x1b[{erase_lines}A\x1b[J");
+            // Move the cursor back over the previous page and its prompt,
+            // then clear downward: the new page replaces the old one instead
+            // of stacking below it.
+            print!("\r\x1b[{erase_lines}A\x1b[J");
         }
 
         let page = &pages[index];
         print!("{page}");
 
         let is_last = index + 1 == pages.len();
-        print!(
-            "page {}/{} · Enter: {} · b: back · q: quit ",
-            index + 1,
-            pages.len(),
-            if is_last { "finish" } else { "next" }
-        );
+        if use_arrows {
+            print!(
+                "page {}/{} · \u{2190}/\u{2192}: navigate · q: quit ",
+                index + 1,
+                pages.len()
+            );
+        } else {
+            print!(
+                "page {}/{} · Enter: {} · b: back · q: quit ",
+                index + 1,
+                pages.len(),
+                if is_last { "finish" } else { "next" }
+            );
+        }
         let _ = io::stdout().flush();
 
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            // EOF or a read error: no way to interact, stop paging.
-            Ok(0) | Err(_) => {
-                println!();
-                break;
-            }
-            Ok(_) => {
-                let command = input.trim();
+        let key = if use_arrows {
+            read_key(&mut stdin)
+        } else {
+            read_line_key(&mut stdin)
+        };
 
-                if command.starts_with(['q', 'Q']) || (is_last && !command.starts_with(['b', 'B']))
-                {
+        match key {
+            PagerKey::Quit => break,
+            PagerKey::Back => index = index.saturating_sub(1),
+            PagerKey::Next => {
+                if is_last {
                     break;
                 }
 
-                if command.starts_with(['b', 'B']) {
-                    index = index.saturating_sub(1);
-                } else {
-                    index += 1;
-                }
+                index += 1;
             }
         }
 
-        erase_lines = page.lines().count() + 1;
+        // In raw mode the prompt line gets no echoed newline, so the cursor
+        // is still on it and `\r` above re-covers it; in line mode Enter
+        // moved one line further down.
+        erase_lines = page.lines().count() + usize::from(!use_arrows);
     }
+
+    if use_arrows {
+        // Clear the prompt line before giving the terminal back.
+        print!("\r\x1b[J");
+    }
+    drop(raw_terminal);
 
     print!(
         "\n{}",
         render_footer(directory, config.include_sub_dir, duration)
     );
+}
+
+enum PagerKey {
+    Next,
+    Back,
+    Quit,
+}
+
+/// Reads one navigation key in raw mode: right arrow or Enter advance, left
+/// arrow goes back, q quits. Arrow keys arrive as the escape sequence
+/// `ESC [ C` (right) or `ESC [ D` (left).
+fn read_key(stdin: &mut io::Stdin) -> PagerKey {
+    let mut byte = [0u8; 1];
+
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(1) => {}
+            // EOF or a read error: no way to interact, stop paging.
+            _ => return PagerKey::Quit,
+        }
+
+        match byte[0] {
+            0x1b => {
+                let mut rest = [0u8; 2];
+                if stdin.read(&mut rest).unwrap_or(0) == 2 && rest[0] == b'[' {
+                    match rest[1] {
+                        b'C' => return PagerKey::Next,
+                        b'D' => return PagerKey::Back,
+                        _ => {}
+                    }
+                }
+            }
+            b'\r' | b'\n' => return PagerKey::Next,
+            b'q' | b'Q' => return PagerKey::Quit,
+            b'b' | b'B' => return PagerKey::Back,
+            _ => {}
+        }
+    }
+}
+
+/// Line-input fallback when raw mode is unavailable: Enter advances, b goes
+/// back, q quits.
+fn read_line_key(stdin: &mut io::Stdin) -> PagerKey {
+    let mut input = String::new();
+
+    match stdin.read_line(&mut input) {
+        // EOF or a read error: no way to interact, stop paging.
+        Ok(0) | Err(_) => PagerKey::Quit,
+        Ok(_) => {
+            let command = input.trim();
+
+            if command.starts_with(['q', 'Q']) {
+                PagerKey::Quit
+            } else if command.starts_with(['b', 'B']) {
+                PagerKey::Back
+            } else {
+                PagerKey::Next
+            }
+        }
+    }
+}
+
+/// Puts the terminal in raw-ish mode (no line buffering, no echo) through
+/// `stty`, restoring the saved state on drop. `None` when stty is missing or
+/// fails, in which case the pager falls back to line input.
+struct RawTerminal {
+    saved_state: String,
+}
+
+impl RawTerminal {
+    fn enable() -> Option<Self> {
+        // `output()` pipes the child's stdin by default; stty needs the real
+        // terminal on stdin to read its state.
+        let saved = Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .ok()?;
+
+        if !saved.status.success() {
+            return None;
+        }
+
+        let saved_state = String::from_utf8(saved.stdout).ok()?.trim().to_string();
+        let status = Command::new("stty")
+            .args(["-icanon", "-echo", "min", "1", "time", "0"])
+            .status()
+            .ok()?;
+
+        status.success().then_some(Self { saved_state })
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        let _ = Command::new("stty").arg(&self.saved_state).status();
+    }
 }
 
 fn render_report(
