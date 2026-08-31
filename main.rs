@@ -257,6 +257,7 @@ fn scan_directory(
 struct ReportRow {
     extension: String,
     files: usize,
+    bytes: u64,
     size: String,
     usage: String,
 }
@@ -282,42 +283,60 @@ fn print_report(
         return;
     }
 
-    let pages = render_report_pages(
-        directory,
-        config.include_sub_dir,
-        duration,
-        extension_stats,
-        Some(PAGE_SIZE),
-    );
-    let mut wait_between_pages = true;
+    let pages = render_report_pages(extension_stats, Some(PAGE_SIZE));
+    let mut index = 0;
+    let mut erase_lines = 0;
 
-    for (index, page) in pages.iter().enumerate() {
-        print!("{page}");
-
-        if index + 1 == pages.len() {
-            break;
+    loop {
+        if erase_lines > 0 {
+            // Move the cursor back over the previous page and its answered
+            // prompt line, then clear downward: the new page replaces the old
+            // one instead of stacking below it.
+            print!("\x1b[{erase_lines}A\x1b[J");
         }
 
-        if wait_between_pages {
-            print!(
-                "page {}/{} · Enter: next · q: quit ",
-                index + 1,
-                pages.len()
-            );
-            let _ = io::stdout().flush();
+        let page = &pages[index];
+        print!("{page}");
 
-            let mut input = String::new();
-            match io::stdin().read_line(&mut input) {
-                // EOF or a read error: no way to interact, print the rest.
-                Ok(0) | Err(_) => wait_between_pages = false,
-                Ok(_) => {
-                    if input.trim_start().starts_with(['q', 'Q']) {
-                        return;
-                    }
+        let is_last = index + 1 == pages.len();
+        print!(
+            "page {}/{} · Enter: {} · b: back · q: quit ",
+            index + 1,
+            pages.len(),
+            if is_last { "finish" } else { "next" }
+        );
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            // EOF or a read error: no way to interact, stop paging.
+            Ok(0) | Err(_) => {
+                println!();
+                break;
+            }
+            Ok(_) => {
+                let command = input.trim();
+
+                if command.starts_with(['q', 'Q']) || (is_last && !command.starts_with(['b', 'B']))
+                {
+                    break;
+                }
+
+                if command.starts_with(['b', 'B']) {
+                    index = index.saturating_sub(1);
+                } else {
+                    index += 1;
                 }
             }
         }
+
+        erase_lines = page.lines().count() + 1;
     }
+
+    print!(
+        "\n{}",
+        render_footer(directory, config.include_sub_dir, duration)
+    );
 }
 
 fn render_report(
@@ -326,27 +345,27 @@ fn render_report(
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
 ) -> String {
-    render_report_pages(directory, include_sub_dir, duration, extension_stats, None)
+    let mut report = render_report_pages(extension_stats, None)
         .pop()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    report.push('\n');
+    report.push_str(&render_footer(directory, include_sub_dir, duration));
+    report
 }
 
 fn render_report_pages(
-    directory: &Path,
-    include_sub_dir: bool,
-    duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
     page_size: Option<usize>,
 ) -> Vec<String> {
     const COLUMN_GAP: usize = 4;
 
-    let total_files: usize = extension_stats.values().map(|stats| stats.files).sum();
     let total_bytes: u64 = extension_stats.values().map(|stats| stats.bytes).sum();
     let mut rows: Vec<ReportRow> = extension_stats
         .iter()
         .map(|(extension, stats)| ReportRow {
             extension: extension.clone(),
             files: stats.files,
+            bytes: stats.bytes,
             size: format_size(stats.bytes),
             usage: format_usage(stats.bytes, total_bytes),
         })
@@ -357,13 +376,32 @@ fn render_report_pages(
         rows.push(ReportRow {
             extension: "(none)".to_string(),
             files: 0,
+            bytes: 0,
             size: "0 B".to_string(),
             usage: "0.0%".to_string(),
         });
     }
 
-    let total_size = format_size(total_bytes);
-    let total_usage = if total_files == 0 { "0.0%" } else { "100.0%" };
+    // One running total per page: the TOTAL row of each page sums what has
+    // been shown up to and including that page, so the last page carries the
+    // grand total.
+    let chunk_size = page_size.unwrap_or(rows.len()).max(1);
+    let mut running_totals = Vec::new();
+    let mut shown_files: usize = 0;
+    let mut shown_bytes: u64 = 0;
+
+    for chunk in rows.chunks(chunk_size) {
+        for row in chunk {
+            shown_files += row.files;
+            shown_bytes += row.bytes;
+        }
+
+        running_totals.push((
+            shown_files.to_string(),
+            format_size(shown_bytes),
+            format_usage(shown_bytes, total_bytes),
+        ));
+    }
 
     let extension_width = rows
         .iter()
@@ -375,23 +413,23 @@ fn render_report_pages(
     let files_width = rows
         .iter()
         .map(|row| row.files.to_string().len())
+        .chain(running_totals.iter().map(|(files, _, _)| files.len()))
         .max()
         .unwrap_or(0)
-        .max(total_files.to_string().len())
         .max("Files".len());
     let size_width = rows
         .iter()
         .map(|row| row.size.len())
+        .chain(running_totals.iter().map(|(_, size, _)| size.len()))
         .max()
         .unwrap_or(0)
-        .max(total_size.len())
         .max("Size".len());
     let usage_width = rows
         .iter()
         .map(|row| row.usage.len())
+        .chain(running_totals.iter().map(|(_, _, usage)| usage.len()))
         .max()
         .unwrap_or(0)
-        .max(total_usage.len())
         .max("Usage".len());
 
     let format_row = |extension: &str, files: &str, size: &str, usage: &str| {
@@ -405,13 +443,11 @@ fn render_report_pages(
         "─".repeat(extension_width + files_width + size_width + usage_width + 3 * COLUMN_GAP)
     );
 
-    let total_row = format_row("TOTAL", &total_files.to_string(), &total_size, total_usage);
-    let chunk_size = page_size.unwrap_or(rows.len()).max(1);
     let mut pages = Vec::new();
 
-    // Every page carries the header and the TOTAL row, so each one reads as a
-    // complete table on its own.
-    for chunk in rows.chunks(chunk_size) {
+    // Every page carries the header and its running TOTAL row, so each one
+    // reads as a complete table on its own.
+    for (chunk, (files, size, usage)) in rows.chunks(chunk_size).zip(&running_totals) {
         let mut page = String::new();
         page.push_str(&format_row("Extension", "Files", "Size", "Usage"));
         page.push_str(&separator);
@@ -426,25 +462,24 @@ fn render_report_pages(
         }
 
         page.push_str(&separator);
-        page.push_str(&total_row);
+        page.push_str(&format_row("TOTAL", files, size, usage));
         pages.push(page);
     }
 
-    if let Some(last_page) = pages.last_mut() {
-        last_page.push('\n');
-        last_page.push_str(&format!(
-            "{} · {} · {}\n",
-            directory.display(),
-            if include_sub_dir {
-                "subdirectories"
-            } else {
-                "current directory"
-            },
-            format_duration(duration)
-        ));
-    }
-
     pages
+}
+
+fn render_footer(directory: &Path, include_sub_dir: bool, duration: Duration) -> String {
+    format!(
+        "{} · {} · {}\n",
+        directory.display(),
+        if include_sub_dir {
+            "subdirectories"
+        } else {
+            "current directory"
+        },
+        format_duration(duration)
+    )
 }
 
 fn format_usage(bytes: u64, total_bytes: u64) -> String {
@@ -638,13 +673,7 @@ TOTAL            3    15 B    100.0%
             );
         }
 
-        let pages = render_report_pages(
-            Path::new("/scan/dir"),
-            true,
-            Duration::from_millis(9),
-            &stats,
-            Some(10),
-        );
+        let pages = render_report_pages(&stats, Some(10));
 
         assert_eq!(pages.len(), 3);
 
@@ -656,12 +685,22 @@ TOTAL            3    15 B    100.0%
         let rule_len = |page: &str| page.lines().nth(1).unwrap().chars().count();
         for page in &pages {
             assert!(page.starts_with("Extension"));
-            assert!(page.contains("TOTAL"));
             assert_eq!(rule_len(page), rule_len(&pages[0]));
+            // The footer belongs to the pager, not to any page.
+            assert!(!page.contains('·'));
         }
 
-        assert!(!pages[0].contains('·'));
-        assert!(pages[2].ends_with("/scan/dir · subdirectories · 9ms\n"));
+        // Each TOTAL row accumulates what has been shown so far.
+        let total_fields = |page: &str| {
+            let line = page.lines().find(|line| line.starts_with("TOTAL")).unwrap();
+            line.split_whitespace()
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(total_fields(&pages[0]), ["10", "100", "B", "40.0%"]);
+        assert_eq!(total_fields(&pages[1]), ["20", "200", "B", "80.0%"]);
+        assert_eq!(total_fields(&pages[2]), ["25", "250", "B", "100.0%"]);
     }
 
     #[test]
@@ -669,17 +708,14 @@ TOTAL            3    15 B    100.0%
         let mut stats = HashMap::new();
         stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 7 });
 
-        let pages = render_report_pages(
-            Path::new("/scan/dir"),
-            false,
-            Duration::from_millis(5),
-            &stats,
-            Some(10),
-        );
+        let pages = render_report_pages(&stats, Some(10));
 
         assert_eq!(pages.len(), 1);
+
+        // A single page plus the footer is exactly the unpaged report.
+        let footer = render_footer(Path::new("/scan/dir"), false, Duration::from_millis(5));
         assert_eq!(
-            pages[0],
+            format!("{}\n{}", pages[0], footer),
             render_report(
                 Path::new("/scan/dir"),
                 false,
