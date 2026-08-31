@@ -310,6 +310,9 @@ fn print_report(
     let show_panel = panel_fits_terminal(&data);
     let mut stdin = io::stdin();
     let mut filter = config.filter.clone();
+    // `Some(input)` while the user is typing after `/`: the input filters the
+    // table live, keystroke by keystroke.
+    let mut search_input: Option<String> = None;
     let mut pages = build_pager_pages(&data, filter.as_deref(), show_panel);
     let mut index = 0;
     let mut erase_lines = 0;
@@ -326,14 +329,17 @@ fn print_report(
         print!("{}", pages[index]);
 
         let is_last = index + 1 == pages.len();
-        let clear_hint = if filter.is_some() { " · c: clear" } else { "" };
-        if use_arrows {
+        if let Some(input) = &search_input {
+            print!("/{input}");
+        } else if use_arrows {
+            let clear_hint = if filter.is_some() { " · c: clear" } else { "" };
             print!(
                 "page {}/{} · \u{2190}/\u{2192}: navigate · /: search{clear_hint} · q: quit ",
                 index + 1,
                 pages.len()
             );
         } else {
+            let clear_hint = if filter.is_some() { " · /: clear" } else { "" };
             print!(
                 "page {}/{} · Enter: {} · b: back · /term: filter{clear_hint} · q: quit ",
                 index + 1,
@@ -342,6 +348,34 @@ fn print_report(
             );
         }
         let _ = io::stdout().flush();
+
+        // While typing a search, every keystroke re-filters and redraws.
+        if let Some(input) = &mut search_input {
+            match read_search_key(&mut stdin) {
+                SearchKey::Char(character) => input.push(character),
+                SearchKey::Backspace => {
+                    input.pop();
+                }
+                SearchKey::Apply => {
+                    filter = Some(input.clone()).filter(|term| !term.is_empty());
+                    search_input = None;
+                }
+                SearchKey::Cancel => search_input = None,
+            }
+
+            let effective = search_input.as_deref().filter(|term| !term.is_empty()).or(
+                if search_input.is_some() {
+                    // Typing with an empty input shows the whole table.
+                    None
+                } else {
+                    filter.as_deref()
+                },
+            );
+            pages = build_pager_pages(&data, effective, show_panel);
+            index = 0;
+            erase_lines = page_line_count;
+            continue;
+        }
 
         let key = if use_arrows {
             read_key(&mut stdin)
@@ -361,17 +395,14 @@ fn print_report(
                 index += 1;
             }
             PagerKey::Search => {
-                // Rewrite the prompt line as a search input; the page above
-                // stays on screen.
-                print!("\r\x1b[K/");
-                let _ = io::stdout().flush();
-
-                if let Some(term) = read_search_term(&mut stdin) {
-                    new_filter = Some(if term.is_empty() { None } else { Some(term) });
-                }
+                // Start with a fresh input showing the whole table; Esc gets
+                // back to the committed filter.
+                search_input = Some(String::new());
+                pages = build_pager_pages(&data, None, show_panel);
+                index = 0;
             }
             PagerKey::SetFilter(term) => {
-                new_filter = Some(if term.is_empty() { None } else { Some(term) });
+                new_filter = Some(Some(term).filter(|term| !term.is_empty()));
             }
         }
 
@@ -501,21 +532,27 @@ fn read_key(stdin: &mut io::Stdin) -> PagerKey {
     }
 }
 
-/// Reads the search term typed after `/` in raw mode, echoing by hand since
-/// terminal echo is off. Enter applies (an empty term clears the filter),
-/// Backspace edits, Esc cancels; arrow-key sequences are swallowed.
-fn read_search_term(stdin: &mut io::Stdin) -> Option<String> {
-    let mut term = String::new();
+enum SearchKey {
+    Char(char),
+    Backspace,
+    Apply,
+    Cancel,
+}
+
+/// Reads one keystroke of the live search in raw mode. Enter applies the
+/// typed term (an empty one clears the filter), Backspace edits, Esc cancels;
+/// arrow-key sequences are swallowed.
+fn read_search_key(stdin: &mut io::Stdin) -> SearchKey {
     let mut byte = [0u8; 1];
 
     loop {
         match stdin.read(&mut byte) {
             Ok(1) => {}
-            _ => return None,
+            _ => return SearchKey::Cancel,
         }
 
         match byte[0] {
-            b'\r' | b'\n' => return Some(term),
+            b'\r' | b'\n' => return SearchKey::Apply,
             0x1b => {
                 let mut rest = [0u8; 1];
                 match stdin.read(&mut rest) {
@@ -524,18 +561,11 @@ fn read_search_term(stdin: &mut io::Stdin) -> Option<String> {
                     Ok(1) if rest[0] == b'[' => {
                         let _ = stdin.read(&mut rest);
                     }
-                    _ => return None,
+                    _ => return SearchKey::Cancel,
                 }
             }
-            0x7f | 0x08 if term.pop().is_some() => {
-                print!("\x08 \x08");
-                let _ = io::stdout().flush();
-            }
-            byte @ 0x20..=0x7e => {
-                term.push(byte as char);
-                print!("{}", byte as char);
-                let _ = io::stdout().flush();
-            }
+            0x7f | 0x08 => return SearchKey::Backspace,
+            byte @ 0x20..=0x7e => return SearchKey::Char(byte as char),
             _ => {}
         }
     }
@@ -649,18 +679,66 @@ fn build_report_rows(extension_stats: &HashMap<String, ExtensionStats>) -> Repor
     }
 }
 
-/// Case-insensitive substring match on the extension name; no filter keeps
-/// every row.
 fn filter_rows<'rows>(rows: &'rows [ReportRow], filter: Option<&str>) -> Vec<&'rows ReportRow> {
     match filter {
         None => rows.iter().collect(),
-        Some(term) => {
-            let term = term.to_lowercase();
-            rows.iter()
-                .filter(|row| row.extension.to_lowercase().contains(&term))
-                .collect()
+        Some(pattern) => rows
+            .iter()
+            .filter(|row| matches_filter(&row.extension, pattern))
+            .collect(),
+    }
+}
+
+/// Filter semantics, always case-insensitive: a plain term is a substring of
+/// the extension ("mp" matches mp3 and bmp); "*.mp3" and ".mp3" match the
+/// extension exactly; any remaining `*` is a wildcard for any sequence
+/// ("m*" for every extension starting with m).
+fn matches_filter(extension: &str, pattern: &str) -> bool {
+    let extension = extension.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    let (pattern, anchored) = match pattern
+        .strip_prefix("*.")
+        .or_else(|| pattern.strip_prefix('.'))
+    {
+        Some(rest) => (rest, true),
+        None => (pattern.as_str(), false),
+    };
+
+    if pattern.contains('*') {
+        glob_match(pattern, &extension)
+    } else if anchored {
+        extension == pattern
+    } else {
+        extension.contains(pattern)
+    }
+}
+
+/// Wildcard match where `*` stands for any sequence of characters.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+    let mut star: Option<(usize, usize)> = None;
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == text[text_index] {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some((pattern_index, text_index));
+            pattern_index += 1;
+        } else if let Some((star_index, matched)) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pattern_index = star_index + 1;
+            text_index = matched + 1;
+            star = Some((star_index, matched + 1));
+        } else {
+            return false;
         }
     }
+
+    pattern[pattern_index..].iter().all(|&c| c == '*')
 }
 
 /// Renders the table pages for the given rows. Usage percentages and the
@@ -1140,6 +1218,28 @@ TOTAL            0     0 B     0.0%
         assert_eq!(names, ["lock", "log"]);
 
         assert!(filter_rows(&data.rows, Some("zz")).is_empty());
+    }
+
+    #[test]
+    fn filters_by_glob_patterns() {
+        // "*.mp3" and ".mp3" pin the extension exactly.
+        assert!(matches_filter("mp3", "*.mp3"));
+        assert!(matches_filter("MP3", "*.mp3"));
+        assert!(matches_filter("sh", ".sh"));
+        assert!(!matches_filter("mp3x", "*.mp3"));
+        assert!(!matches_filter("bash", ".sh"));
+
+        // A bare `*` is a wildcard for any sequence.
+        assert!(matches_filter("mp3", "m*"));
+        assert!(matches_filter("mp3", "m*3"));
+        assert!(matches_filter("markdown", "m*"));
+        assert!(!matches_filter("bmp", "m*"));
+        assert!(matches_filter("mp3", "*.mp*"));
+        assert!(matches_filter("mpeg", "*.mp*"));
+
+        // Plain terms stay substring matches.
+        assert!(matches_filter("bmp", "mp"));
+        assert!(matches_filter("mp4", "mp"));
     }
 
     #[test]
