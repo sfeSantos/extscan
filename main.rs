@@ -215,9 +215,18 @@ fn scan_directory(
                 .map(|value| value.to_string_lossy().into_owned())
             {
                 if !extension.is_empty() {
-                    // Fails for dangling symlinks and files removed mid-scan;
-                    // skip those instead of aborting.
-                    if let Ok(metadata) = fs::metadata(&path) {
+                    // Regular files get their size straight from the entry, one
+                    // syscall with no path re-resolution. Only symlinks need the
+                    // following stat to size the target. Either call fails for
+                    // dangling symlinks and files removed mid-scan; skip those
+                    // instead of aborting.
+                    let metadata = if file_type.is_file() {
+                        entry.metadata()
+                    } else {
+                        fs::metadata(&path)
+                    };
+
+                    if let Ok(metadata) = metadata {
                         if metadata.is_file() {
                             extension_stats
                                 .entry(extension)
@@ -246,9 +255,23 @@ fn print_report(
     duration: Duration,
     extension_stats: &BTreeMap<String, ExtensionStats>,
 ) {
+    print!(
+        "{}",
+        render_report(directory, include_sub_dir, duration, extension_stats)
+    );
+}
+
+fn render_report(
+    directory: &Path,
+    include_sub_dir: bool,
+    duration: Duration,
+    extension_stats: &BTreeMap<String, ExtensionStats>,
+) -> String {
+    const COLUMN_GAP: usize = 4;
+
     let total_files: usize = extension_stats.values().map(|stats| stats.files).sum();
     let total_bytes: u64 = extension_stats.values().map(|stats| stats.bytes).sum();
-    let rows: Vec<ReportRow> = extension_stats
+    let mut rows: Vec<ReportRow> = extension_stats
         .iter()
         .map(|(extension, stats)| ReportRow {
             extension: extension.clone(),
@@ -257,6 +280,15 @@ fn print_report(
             usage: format_usage(stats.bytes, total_bytes),
         })
         .collect();
+
+    if rows.is_empty() {
+        rows.push(ReportRow {
+            extension: "(none)".to_string(),
+            files: 0,
+            size: "0 B".to_string(),
+            usage: "0.0%".to_string(),
+        });
+    }
 
     let total_size = format_size(total_bytes);
     let total_usage = if total_files == 0 { "0.0%" } else { "100.0%" };
@@ -267,7 +299,6 @@ fn print_report(
         .max()
         .unwrap_or(0)
         .max("Extension".len())
-        .max("(none)".len())
         .max("TOTAL".len());
     let files_width = rows
         .iter()
@@ -290,86 +321,51 @@ fn print_report(
         .unwrap_or(0)
         .max(total_usage.len())
         .max("Usage".len());
+
+    let format_row = |extension: &str, files: &str, size: &str, usage: &str| {
+        format!(
+            "{extension:<extension_width$}{gap}{files:>files_width$}{gap}{size:>size_width$}{gap}{usage:>usage_width$}\n",
+            gap = " ".repeat(COLUMN_GAP)
+        )
+    };
     let separator = format!(
-        "+-{:-<extension_width$}-+-{:-<files_width$}-+-{:-<size_width$}-+-{:-<usage_width$}-+",
-        "",
-        "",
-        "",
-        "",
-        extension_width = extension_width,
-        files_width = files_width,
-        size_width = size_width,
-        usage_width = usage_width
+        "{}\n",
+        "─".repeat(extension_width + files_width + size_width + usage_width + 3 * COLUMN_GAP)
     );
 
-    println!("File extension report");
-    println!("Directory: {}", directory.display());
-    println!(
-        "Scope: {}",
-        if include_sub_dir {
-            "current directory + subdirectories"
-        } else {
-            "current directory only"
-        }
-    );
-    println!("Duration: {}", format_duration(duration));
-    println!();
+    let mut report = String::new();
+    report.push_str(&format_row("Extension", "Files", "Size", "Usage"));
+    report.push_str(&separator);
 
-    println!("{separator}");
-    println!(
-        "| {:<extension_width$} | {:>files_width$} | {:>size_width$} | {:>usage_width$} |",
-        "Extension",
-        "Files",
-        "Size",
-        "Usage",
-        extension_width = extension_width,
-        files_width = files_width,
-        size_width = size_width,
-        usage_width = usage_width
-    );
-    println!("{separator}");
-
-    if rows.is_empty() {
-        println!(
-            "| {:<extension_width$} | {:>files_width$} | {:>size_width$} | {:>usage_width$} |",
-            "(none)",
-            0,
-            "0 B",
-            "0.0%",
-            extension_width = extension_width,
-            files_width = files_width,
-            size_width = size_width,
-            usage_width = usage_width
-        );
-    } else {
-        for row in &rows {
-            println!(
-                "| {:<extension_width$} | {:>files_width$} | {:>size_width$} | {:>usage_width$} |",
-                row.extension,
-                row.files,
-                row.size,
-                row.usage,
-                extension_width = extension_width,
-                files_width = files_width,
-                size_width = size_width,
-                usage_width = usage_width
-            );
-        }
+    for row in &rows {
+        report.push_str(&format_row(
+            &row.extension,
+            &row.files.to_string(),
+            &row.size,
+            &row.usage,
+        ));
     }
 
-    println!("{separator}");
-    println!(
-        "| {:<extension_width$} | {:>files_width$} | {:>size_width$} | {:>usage_width$} |",
+    report.push_str(&separator);
+    report.push_str(&format_row(
         "TOTAL",
-        total_files,
-        total_size,
+        &total_files.to_string(),
+        &total_size,
         total_usage,
-        extension_width = extension_width,
-        files_width = files_width,
-        size_width = size_width,
-        usage_width = usage_width
-    );
-    println!("{separator}");
+    ));
+    report.push('\n');
+    report.push_str(&format!(
+        "{} · {} · {}\n",
+        directory.display(),
+        if include_sub_dir {
+            "subdirectories"
+        } else {
+            "current directory"
+        },
+        format_duration(duration)
+    ));
+
+    report
 }
 
 fn format_usage(bytes: u64, total_bytes: u64) -> String {
@@ -522,5 +518,54 @@ mod tests {
     fn formats_durations() {
         assert_eq!(format_duration(Duration::from_millis(38)), "38ms");
         assert_eq!(format_duration(Duration::from_millis(1240)), "1.24s");
+    }
+
+    #[test]
+    fn renders_borderless_report() {
+        let mut stats = BTreeMap::new();
+        stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 7 });
+        stats.insert("txt".to_string(), ExtensionStats { files: 2, bytes: 8 });
+
+        let report = render_report(
+            Path::new("/scan/dir"),
+            true,
+            Duration::from_millis(122),
+            &stats,
+        );
+
+        let expected = "\
+Extension    Files    Size     Usage
+────────────────────────────────────
+rs               1     7 B     46.7%
+txt              2     8 B     53.3%
+────────────────────────────────────
+TOTAL            3    15 B    100.0%
+
+/scan/dir · subdirectories · 122ms
+";
+        assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn renders_empty_report() {
+        let stats = BTreeMap::new();
+
+        let report = render_report(
+            Path::new("/scan/dir"),
+            false,
+            Duration::from_millis(5),
+            &stats,
+        );
+
+        let expected = "\
+Extension    Files    Size    Usage
+───────────────────────────────────
+(none)           0     0 B     0.0%
+───────────────────────────────────
+TOTAL            0     0 B     0.0%
+
+/scan/dir · current directory · 5ms
+";
+        assert_eq!(report, expected);
     }
 }
