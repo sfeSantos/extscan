@@ -21,7 +21,10 @@ fn main() -> io::Result<()> {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("Usage: {} [--include-sub-dir] [--no-pager]", program_name);
+            eprintln!(
+                "Usage: {} [--include-sub-dir] [--no-pager] [--filter <term>]",
+                program_name
+            );
             std::process::exit(1);
         }
     };
@@ -39,18 +42,26 @@ fn main() -> io::Result<()> {
 struct Config {
     include_sub_dir: bool,
     no_pager: bool,
+    filter: Option<String>,
 }
 
 impl Config {
     fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut args = args;
         let mut include_sub_dir = false;
         let mut no_pager = false;
+        let mut filter = None;
 
-        for arg in args {
+        while let Some(arg) = args.next() {
             if arg == "--include-sub-dir" {
                 include_sub_dir = true;
             } else if arg == "--no-pager" {
                 no_pager = true;
+            } else if arg == "--filter" {
+                filter = Some(
+                    args.next()
+                        .ok_or_else(|| "Missing value for --filter".to_string())?,
+                );
             } else if arg.starts_with("--") {
                 return Err(format!("Unknown argument: {arg}"));
             } else {
@@ -61,6 +72,7 @@ impl Config {
         Ok(Self {
             include_sub_dir,
             no_pager,
+            filter,
         })
     }
 }
@@ -271,25 +283,37 @@ fn print_report(
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
 ) {
+    let data = build_report_rows(extension_stats);
     let use_pager = !config.no_pager
-        && extension_stats.len() > PAGE_SIZE
+        && data.rows.len() > PAGE_SIZE
         && io::stdout().is_terminal()
         && io::stdin().is_terminal();
 
     if !use_pager {
         print!(
             "{}",
-            render_report(directory, config.include_sub_dir, duration, extension_stats)
+            render_report(
+                directory,
+                config.include_sub_dir,
+                duration,
+                extension_stats,
+                config.filter.as_deref()
+            )
         );
         return;
     }
 
-    let pages = render_report_pages(extension_stats, Some(PAGE_SIZE));
     // Raw mode lets arrow keys work without Enter; when the terminal cannot
     // be switched (no stty, as on Windows), fall back to line input.
     let raw_terminal = RawTerminal::enable();
     let use_arrows = raw_terminal.is_some();
+    let show_panel = panel_fits_terminal(&data);
     let mut stdin = io::stdin();
+    let mut filter = config.filter.clone();
+    // `Some(input)` while the user is typing after `/`: the input filters the
+    // table live, keystroke by keystroke.
+    let mut search_input: Option<String> = None;
+    let mut pages = build_pager_pages(&data, filter.as_deref(), show_panel);
     let mut index = 0;
     let mut erase_lines = 0;
 
@@ -301,19 +325,23 @@ fn print_report(
             print!("\r\x1b[{erase_lines}A\x1b[J");
         }
 
-        let page = &pages[index];
-        print!("{page}");
+        let page_line_count = pages[index].lines().count();
+        print!("{}", pages[index]);
 
         let is_last = index + 1 == pages.len();
-        if use_arrows {
+        if let Some(input) = &search_input {
+            print!("/{input}");
+        } else if use_arrows {
+            let clear_hint = if filter.is_some() { " · c: clear" } else { "" };
             print!(
-                "page {}/{} · \u{2190}/\u{2192}: navigate · q: quit ",
+                "page {}/{} · \u{2190}/\u{2192}: navigate · /: search{clear_hint} · q: quit ",
                 index + 1,
                 pages.len()
             );
         } else {
+            let clear_hint = if filter.is_some() { " · /: clear" } else { "" };
             print!(
-                "page {}/{} · Enter: {} · b: back · q: quit ",
+                "page {}/{} · Enter: {} · b: back · /term: filter{clear_hint} · q: quit ",
                 index + 1,
                 pages.len(),
                 if is_last { "finish" } else { "next" }
@@ -321,12 +349,41 @@ fn print_report(
         }
         let _ = io::stdout().flush();
 
+        // While typing a search, every keystroke re-filters and redraws.
+        if let Some(input) = &mut search_input {
+            match read_search_key(&mut stdin) {
+                SearchKey::Char(character) => input.push(character),
+                SearchKey::Backspace => {
+                    input.pop();
+                }
+                SearchKey::Apply => {
+                    filter = Some(input.clone()).filter(|term| !term.is_empty());
+                    search_input = None;
+                }
+                SearchKey::Cancel => search_input = None,
+            }
+
+            let effective = search_input.as_deref().filter(|term| !term.is_empty()).or(
+                if search_input.is_some() {
+                    // Typing with an empty input shows the whole table.
+                    None
+                } else {
+                    filter.as_deref()
+                },
+            );
+            pages = build_pager_pages(&data, effective, show_panel);
+            index = 0;
+            erase_lines = page_line_count;
+            continue;
+        }
+
         let key = if use_arrows {
             read_key(&mut stdin)
         } else {
             read_line_key(&mut stdin)
         };
 
+        let mut new_filter = None;
         match key {
             PagerKey::Quit => break,
             PagerKey::Back => index = index.saturating_sub(1),
@@ -337,12 +394,28 @@ fn print_report(
 
                 index += 1;
             }
+            PagerKey::Search => {
+                // Start with a fresh input showing the whole table; Esc gets
+                // back to the committed filter.
+                search_input = Some(String::new());
+                pages = build_pager_pages(&data, None, show_panel);
+                index = 0;
+            }
+            PagerKey::SetFilter(term) => {
+                new_filter = Some(Some(term).filter(|term| !term.is_empty()));
+            }
+        }
+
+        if let Some(applied) = new_filter {
+            filter = applied;
+            pages = build_pager_pages(&data, filter.as_deref(), show_panel);
+            index = 0;
         }
 
         // In raw mode the prompt line gets no echoed newline, so the cursor
         // is still on it and `\r` above re-covers it; in line mode Enter
         // moved one line further down.
-        erase_lines = page.lines().count() + usize::from(!use_arrows);
+        erase_lines = page_line_count + usize::from(!use_arrows);
     }
 
     if use_arrows {
@@ -357,15 +430,77 @@ fn print_report(
     );
 }
 
+/// Renders the pager view of one filter state: the filtered table pages,
+/// each with the side panel attached when it fits.
+fn build_pager_pages(data: &ReportData, filter: Option<&str>, show_panel: bool) -> Vec<String> {
+    let matched = filter_rows(&data.rows, filter);
+    let matched_count = matched.len();
+    let mut pages = render_pages(&matched, data.total_bytes, Some(PAGE_SIZE));
+
+    if show_panel {
+        let panel = render_side_panel(data, filter, matched_count);
+        pages = pages
+            .iter()
+            .map(|page| attach_panel(page, &panel))
+            .collect();
+    }
+
+    pages
+}
+
+/// The panel goes in only when the terminal is wide enough for the unfiltered
+/// table plus the panel; an unknown width lets it in.
+fn panel_fits_terminal(data: &ReportData) -> bool {
+    let Some(columns) = terminal_columns() else {
+        return true;
+    };
+    let rows = filter_rows(&data.rows, None);
+    let table_width = render_pages(&rows, data.total_bytes, Some(PAGE_SIZE))
+        .first()
+        .map(|page| page.lines().map(|line| line.chars().count()).max())
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let panel_width = render_side_panel(data, None, data.rows.len())
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    columns >= table_width + PANEL_SEPARATOR.chars().count() + panel_width
+}
+
+fn terminal_columns() -> Option<usize> {
+    let output = Command::new("stty")
+        .arg("size")
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+        // Zero means the terminal did not report a size; treat it as unknown.
+        .filter(|&columns| columns > 0)
+}
+
 enum PagerKey {
     Next,
     Back,
     Quit,
+    Search,
+    SetFilter(String),
 }
 
 /// Reads one navigation key in raw mode: right arrow or Enter advance, left
-/// arrow goes back, q quits. Arrow keys arrive as the escape sequence
-/// `ESC [ C` (right) or `ESC [ D` (left).
+/// arrow goes back, / opens the search, c clears the filter, q quits. Arrow
+/// keys arrive as the escape sequence `ESC [ C` (right) or `ESC [ D` (left).
 fn read_key(stdin: &mut io::Stdin) -> PagerKey {
     let mut byte = [0u8; 1];
 
@@ -390,13 +525,54 @@ fn read_key(stdin: &mut io::Stdin) -> PagerKey {
             b'\r' | b'\n' => return PagerKey::Next,
             b'q' | b'Q' => return PagerKey::Quit,
             b'b' | b'B' => return PagerKey::Back,
+            b'/' => return PagerKey::Search,
+            b'c' | b'C' => return PagerKey::SetFilter(String::new()),
+            _ => {}
+        }
+    }
+}
+
+enum SearchKey {
+    Char(char),
+    Backspace,
+    Apply,
+    Cancel,
+}
+
+/// Reads one keystroke of the live search in raw mode. Enter applies the
+/// typed term (an empty one clears the filter), Backspace edits, Esc cancels;
+/// arrow-key sequences are swallowed.
+fn read_search_key(stdin: &mut io::Stdin) -> SearchKey {
+    let mut byte = [0u8; 1];
+
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(1) => {}
+            _ => return SearchKey::Cancel,
+        }
+
+        match byte[0] {
+            b'\r' | b'\n' => return SearchKey::Apply,
+            0x1b => {
+                let mut rest = [0u8; 1];
+                match stdin.read(&mut rest) {
+                    // An arrow or another CSI sequence: discard its final byte
+                    // and keep typing. Anything else after Esc cancels.
+                    Ok(1) if rest[0] == b'[' => {
+                        let _ = stdin.read(&mut rest);
+                    }
+                    _ => return SearchKey::Cancel,
+                }
+            }
+            0x7f | 0x08 => return SearchKey::Backspace,
+            byte @ 0x20..=0x7e => return SearchKey::Char(byte as char),
             _ => {}
         }
     }
 }
 
 /// Line-input fallback when raw mode is unavailable: Enter advances, b goes
-/// back, q quits.
+/// back, `/term` filters (a bare `/` clears), q quits.
 fn read_line_key(stdin: &mut io::Stdin) -> PagerKey {
     let mut input = String::new();
 
@@ -406,7 +582,9 @@ fn read_line_key(stdin: &mut io::Stdin) -> PagerKey {
         Ok(_) => {
             let command = input.trim();
 
-            if command.starts_with(['q', 'Q']) {
+            if let Some(term) = command.strip_prefix('/') {
+                PagerKey::SetFilter(term.trim().to_string())
+            } else if command.starts_with(['q', 'Q']) {
                 PagerKey::Quit
             } else if command.starts_with(['b', 'B']) {
                 PagerKey::Back
@@ -459,8 +637,11 @@ fn render_report(
     include_sub_dir: bool,
     duration: Duration,
     extension_stats: &HashMap<String, ExtensionStats>,
+    filter: Option<&str>,
 ) -> String {
-    let mut report = render_report_pages(extension_stats, None)
+    let data = build_report_rows(extension_stats);
+    let matched = filter_rows(&data.rows, filter);
+    let mut report = render_pages(&matched, data.total_bytes, None)
         .pop()
         .unwrap_or_default();
     report.push('\n');
@@ -468,12 +649,16 @@ fn render_report(
     report
 }
 
-fn render_report_pages(
-    extension_stats: &HashMap<String, ExtensionStats>,
-    page_size: Option<usize>,
-) -> Vec<String> {
-    const COLUMN_GAP: usize = 4;
+/// The sorted report rows plus the grand totals of the whole scan, built once
+/// so filtering never loses sight of them.
+struct ReportData {
+    rows: Vec<ReportRow>,
+    total_files: usize,
+    total_bytes: u64,
+}
 
+fn build_report_rows(extension_stats: &HashMap<String, ExtensionStats>) -> ReportData {
+    let total_files: usize = extension_stats.values().map(|stats| stats.files).sum();
     let total_bytes: u64 = extension_stats.values().map(|stats| stats.bytes).sum();
     let mut rows: Vec<ReportRow> = extension_stats
         .iter()
@@ -487,19 +672,97 @@ fn render_report_pages(
         .collect();
     rows.sort_by(|a, b| a.extension.cmp(&b.extension));
 
-    if rows.is_empty() {
-        rows.push(ReportRow {
-            extension: "(none)".to_string(),
-            files: 0,
-            bytes: 0,
-            size: "0 B".to_string(),
-            usage: "0.0%".to_string(),
-        });
+    ReportData {
+        rows,
+        total_files,
+        total_bytes,
     }
+}
+
+fn filter_rows<'rows>(rows: &'rows [ReportRow], filter: Option<&str>) -> Vec<&'rows ReportRow> {
+    match filter {
+        None => rows.iter().collect(),
+        Some(pattern) => rows
+            .iter()
+            .filter(|row| matches_filter(&row.extension, pattern))
+            .collect(),
+    }
+}
+
+/// Filter semantics, always case-insensitive: a plain term is a substring of
+/// the extension ("mp" matches mp3 and bmp); "*.mp3" and ".mp3" match the
+/// extension exactly; any remaining `*` is a wildcard for any sequence
+/// ("m*" for every extension starting with m).
+fn matches_filter(extension: &str, pattern: &str) -> bool {
+    let extension = extension.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    let (pattern, anchored) = match pattern
+        .strip_prefix("*.")
+        .or_else(|| pattern.strip_prefix('.'))
+    {
+        Some(rest) => (rest, true),
+        None => (pattern.as_str(), false),
+    };
+
+    if pattern.contains('*') {
+        glob_match(pattern, &extension)
+    } else if anchored {
+        extension == pattern
+    } else {
+        extension.contains(pattern)
+    }
+}
+
+/// Wildcard match where `*` stands for any sequence of characters.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+    let mut star: Option<(usize, usize)> = None;
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == text[text_index] {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some((pattern_index, text_index));
+            pattern_index += 1;
+        } else if let Some((star_index, matched)) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pattern_index = star_index + 1;
+            text_index = matched + 1;
+            star = Some((star_index, matched + 1));
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_index..].iter().all(|&c| c == '*')
+}
+
+/// Renders the table pages for the given rows. Usage percentages and the
+/// running totals stay relative to `total_bytes`, the grand total of the
+/// scan, so a filtered view keeps its meaning.
+fn render_pages(rows: &[&ReportRow], total_bytes: u64, page_size: Option<usize>) -> Vec<String> {
+    const COLUMN_GAP: usize = 4;
+
+    let placeholder = ReportRow {
+        extension: "(none)".to_string(),
+        files: 0,
+        bytes: 0,
+        size: "0 B".to_string(),
+        usage: "0.0%".to_string(),
+    };
+    let rows: Vec<&ReportRow> = if rows.is_empty() {
+        vec![&placeholder]
+    } else {
+        rows.to_vec()
+    };
 
     // One running total per page: the TOTAL row of each page sums what has
     // been shown up to and including that page, so the last page carries the
-    // grand total.
+    // total of everything listed.
     let chunk_size = page_size.unwrap_or(rows.len()).max(1);
     let mut running_totals = Vec::new();
     let mut shown_files: usize = 0;
@@ -582,6 +845,69 @@ fn render_report_pages(
     }
 
     pages
+}
+
+const PANEL_SEPARATOR: &str = "  \u{2502}  ";
+
+/// The side panel of the pager: the grand totals of the scan, the three
+/// largest extensions, and the filter state. It never changes with the page
+/// or the filter, keeping the whole-scan context in sight.
+fn render_side_panel(data: &ReportData, filter: Option<&str>, matched: usize) -> Vec<String> {
+    let mut lines = vec![
+        "SCAN".to_string(),
+        format!("{} files", data.total_files),
+        format!(
+            "{} · {} ext",
+            format_size(data.total_bytes),
+            data.rows.len()
+        ),
+        String::new(),
+        "TOP 3".to_string(),
+    ];
+
+    let mut by_size: Vec<&ReportRow> = data.rows.iter().collect();
+    by_size.sort_by_key(|row| std::cmp::Reverse(row.bytes));
+    let top = &by_size[..by_size.len().min(3)];
+    let name_width = top.iter().map(|row| row.extension.len()).max().unwrap_or(0);
+
+    for row in top {
+        lines.push(format!("{:<name_width$}  {}", row.extension, row.size));
+    }
+
+    lines.push(String::new());
+    lines.push(match filter {
+        Some(term) => format!("filter: \"{term}\" ({matched}/{})", data.rows.len()),
+        None => "filter: (none)".to_string(),
+    });
+
+    lines
+}
+
+/// Glues the panel to the right of a table page, line by line.
+fn attach_panel(page: &str, panel: &[String]) -> String {
+    let table_width = page
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let line_count = page.lines().count().max(panel.len());
+    let mut page_lines = page.lines();
+    let mut output = String::new();
+
+    for panel_index in 0..line_count {
+        let left = page_lines.next().unwrap_or("");
+        let padding = table_width.saturating_sub(left.chars().count());
+        let mut line = format!(
+            "{left}{}{PANEL_SEPARATOR}{}",
+            " ".repeat(padding),
+            panel.get(panel_index).map(String::as_str).unwrap_or("")
+        );
+        line.truncate(line.trim_end().len());
+        output.push_str(&line);
+        output.push('\n');
+    }
+
+    output
 }
 
 fn render_footer(directory: &Path, include_sub_dir: bool, duration: Duration) -> String {
@@ -760,6 +1086,7 @@ mod tests {
             true,
             Duration::from_millis(122),
             &stats,
+            None,
         );
 
         let expected = "\
@@ -788,7 +1115,9 @@ TOTAL            3    15 B    100.0%
             );
         }
 
-        let pages = render_report_pages(&stats, Some(10));
+        let data = build_report_rows(&stats);
+        let rows = filter_rows(&data.rows, None);
+        let pages = render_pages(&rows, data.total_bytes, Some(10));
 
         assert_eq!(pages.len(), 3);
 
@@ -823,7 +1152,9 @@ TOTAL            3    15 B    100.0%
         let mut stats = HashMap::new();
         stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 7 });
 
-        let pages = render_report_pages(&stats, Some(10));
+        let data = build_report_rows(&stats);
+        let rows = filter_rows(&data.rows, None);
+        let pages = render_pages(&rows, data.total_bytes, Some(10));
 
         assert_eq!(pages.len(), 1);
 
@@ -835,7 +1166,8 @@ TOTAL            3    15 B    100.0%
                 Path::new("/scan/dir"),
                 false,
                 Duration::from_millis(5),
-                &stats
+                &stats,
+                None
             )
         );
     }
@@ -849,6 +1181,7 @@ TOTAL            3    15 B    100.0%
             false,
             Duration::from_millis(5),
             &stats,
+            None,
         );
 
         let expected = "\
@@ -861,5 +1194,185 @@ TOTAL            0     0 B     0.0%
 /scan/dir · current directory · 5ms
 ";
         assert_eq!(report, expected);
+    }
+
+    #[test]
+    fn parses_filter_flag() {
+        let config =
+            Config::from_args(["--filter".to_string(), "rs".to_string()].into_iter()).unwrap();
+        assert_eq!(config.filter.as_deref(), Some("rs"));
+
+        assert!(Config::from_args(["--filter".to_string()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn filters_case_insensitive_substring() {
+        let mut stats = HashMap::new();
+        stats.insert("lock".to_string(), ExtensionStats { files: 1, bytes: 1 });
+        stats.insert("log".to_string(), ExtensionStats { files: 1, bytes: 1 });
+        stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 1 });
+        let data = build_report_rows(&stats);
+
+        let matched = filter_rows(&data.rows, Some("LO"));
+        let names: Vec<&str> = matched.iter().map(|row| row.extension.as_str()).collect();
+        assert_eq!(names, ["lock", "log"]);
+
+        assert!(filter_rows(&data.rows, Some("zz")).is_empty());
+    }
+
+    #[test]
+    fn filters_by_glob_patterns() {
+        // "*.mp3" and ".mp3" pin the extension exactly.
+        assert!(matches_filter("mp3", "*.mp3"));
+        assert!(matches_filter("MP3", "*.mp3"));
+        assert!(matches_filter("sh", ".sh"));
+        assert!(!matches_filter("mp3x", "*.mp3"));
+        assert!(!matches_filter("bash", ".sh"));
+
+        // A bare `*` is a wildcard for any sequence.
+        assert!(matches_filter("mp3", "m*"));
+        assert!(matches_filter("mp3", "m*3"));
+        assert!(matches_filter("markdown", "m*"));
+        assert!(!matches_filter("bmp", "m*"));
+        assert!(matches_filter("mp3", "*.mp*"));
+        assert!(matches_filter("mpeg", "*.mp*"));
+
+        // Plain terms stay substring matches.
+        assert!(matches_filter("bmp", "mp"));
+        assert!(matches_filter("mp4", "mp"));
+    }
+
+    #[test]
+    fn filtered_report_keeps_grand_total_usage() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "rs".to_string(),
+            ExtensionStats {
+                files: 1,
+                bytes: 25,
+            },
+        );
+        stats.insert(
+            "txt".to_string(),
+            ExtensionStats {
+                files: 3,
+                bytes: 75,
+            },
+        );
+
+        let report = render_report(
+            Path::new("/scan/dir"),
+            false,
+            Duration::from_millis(5),
+            &stats,
+            Some("rs"),
+        );
+
+        // Only the matching row, with usage still relative to the 100-byte
+        // grand total, and the TOTAL row summing just what matched.
+        assert!(report.contains("rs               1    25 B    25.0%"));
+        assert!(!report.contains("txt"));
+        assert!(report.contains("TOTAL            1    25 B    25.0%"));
+    }
+
+    #[test]
+    fn no_match_renders_empty_layout() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "rs".to_string(),
+            ExtensionStats {
+                files: 1,
+                bytes: 25,
+            },
+        );
+
+        let report = render_report(
+            Path::new("/scan/dir"),
+            false,
+            Duration::from_millis(5),
+            &stats,
+            Some("zz"),
+        );
+
+        assert!(report.contains("(none)"));
+        assert!(report.contains("TOTAL"));
+    }
+
+    #[test]
+    fn side_panel_shows_scan_top3_and_filter() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "gz".to_string(),
+            ExtensionStats {
+                files: 2,
+                bytes: 400,
+            },
+        );
+        stats.insert(
+            "mp4".to_string(),
+            ExtensionStats {
+                files: 1,
+                bytes: 300,
+            },
+        );
+        stats.insert(
+            "png".to_string(),
+            ExtensionStats {
+                files: 5,
+                bytes: 200,
+            },
+        );
+        stats.insert(
+            "rs".to_string(),
+            ExtensionStats {
+                files: 9,
+                bytes: 100,
+            },
+        );
+        let data = build_report_rows(&stats);
+
+        let panel = render_side_panel(&data, None, data.rows.len());
+        assert_eq!(panel[0], "SCAN");
+        assert_eq!(panel[1], "17 files");
+        assert_eq!(panel[2], "1000 B · 4 ext");
+        assert_eq!(panel[4], "TOP 3");
+        assert!(panel[5].starts_with("gz"));
+        assert!(panel[6].starts_with("mp4"));
+        assert!(panel[7].starts_with("png"));
+        assert_eq!(panel[9], "filter: (none)");
+
+        let filtered = render_side_panel(&data, Some("p"), 2);
+        assert_eq!(filtered[9], "filter: \"p\" (2/4)");
+    }
+
+    #[test]
+    fn attach_panel_aligns_the_separator() {
+        let mut stats = HashMap::new();
+        for i in 0..15 {
+            stats.insert(
+                format!("e{i:02}"),
+                ExtensionStats {
+                    files: 1,
+                    bytes: 10,
+                },
+            );
+        }
+        let data = build_report_rows(&stats);
+        let rows = filter_rows(&data.rows, None);
+        let page = &render_pages(&rows, data.total_bytes, Some(10))[0];
+        let panel = render_side_panel(&data, None, data.rows.len());
+
+        let merged = attach_panel(page, &panel);
+
+        let separator_columns: Vec<Option<usize>> = merged
+            .lines()
+            .map(|line| line.chars().position(|c| c == '\u{2502}'))
+            .collect();
+        assert!(merged.lines().count() >= panel.len());
+        for column in separator_columns.iter().flatten() {
+            assert_eq!(Some(*column), separator_columns[0]);
+        }
+        assert!(merged.contains("SCAN"));
+        assert!(merged.contains("filter: (none)"));
     }
 }
