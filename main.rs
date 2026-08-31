@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -83,7 +83,7 @@ impl ExtensionStats {
 fn collect_extension_stats(
     directory: &Path,
     include_sub_dir: bool,
-) -> io::Result<BTreeMap<String, ExtensionStats>> {
+) -> io::Result<HashMap<String, ExtensionStats>> {
     // Only the root is fatal; unreadable entries below it are skipped with a
     // warning during the scan.
     fs::read_dir(directory).map(drop)?;
@@ -102,7 +102,7 @@ fn collect_extension_stats(
             .collect()
     });
 
-    let mut extension_stats = BTreeMap::new();
+    let mut extension_stats = HashMap::new();
     for worker_stats in worker_results {
         for (extension, stats) in worker_stats {
             extension_stats
@@ -207,37 +207,47 @@ fn scan_directory(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        let path = entry.path();
 
         if file_type.is_file() || file_type.is_symlink() {
-            if let Some(extension) = path
-                .extension()
-                .map(|value| value.to_string_lossy().into_owned())
-            {
-                if !extension.is_empty() {
-                    // Regular files get their size straight from the entry, one
-                    // syscall with no path re-resolution. Only symlinks need the
-                    // following stat to size the target. Either call fails for
-                    // dangling symlinks and files removed mid-scan; skip those
-                    // instead of aborting.
-                    let metadata = if file_type.is_file() {
-                        entry.metadata()
-                    } else {
-                        fs::metadata(&path)
-                    };
+            // Only the name is needed for the extension; building the full
+            // entry path here would allocate once per file for nothing.
+            let file_name = entry.file_name();
+            let Some(extension) = Path::new(&file_name).extension() else {
+                continue;
+            };
+            let extension = extension.to_string_lossy();
 
-                    if let Ok(metadata) = metadata {
-                        if metadata.is_file() {
-                            extension_stats
-                                .entry(extension)
-                                .or_default()
-                                .add_file(metadata.len());
+            if extension.is_empty() {
+                continue;
+            }
+
+            // Regular files get their size straight from the entry, one
+            // syscall with no path re-resolution. Only symlinks need the
+            // following stat to size the target. Either call fails for
+            // dangling symlinks and files removed mid-scan; skip those
+            // instead of aborting.
+            let metadata = if file_type.is_file() {
+                entry.metadata()
+            } else {
+                fs::metadata(entry.path())
+            };
+
+            if let Ok(metadata) = metadata {
+                if metadata.is_file() {
+                    // Borrowed lookup first: the extension String is only
+                    // allocated the first time a worker sees it.
+                    match extension_stats.get_mut(extension.as_ref()) {
+                        Some(stats) => stats.add_file(metadata.len()),
+                        None => {
+                            let mut stats = ExtensionStats::default();
+                            stats.add_file(metadata.len());
+                            extension_stats.insert(extension.into_owned(), stats);
                         }
                     }
                 }
             }
         } else if include_sub_dir && file_type.is_dir() {
-            queue.push_directory(path);
+            queue.push_directory(entry.path());
         }
     }
 }
@@ -253,7 +263,7 @@ fn print_report(
     directory: &Path,
     include_sub_dir: bool,
     duration: Duration,
-    extension_stats: &BTreeMap<String, ExtensionStats>,
+    extension_stats: &HashMap<String, ExtensionStats>,
 ) {
     print!(
         "{}",
@@ -265,7 +275,7 @@ fn render_report(
     directory: &Path,
     include_sub_dir: bool,
     duration: Duration,
-    extension_stats: &BTreeMap<String, ExtensionStats>,
+    extension_stats: &HashMap<String, ExtensionStats>,
 ) -> String {
     const COLUMN_GAP: usize = 4;
 
@@ -280,6 +290,7 @@ fn render_report(
             usage: format_usage(stats.bytes, total_bytes),
         })
         .collect();
+    rows.sort_by(|a, b| a.extension.cmp(&b.extension));
 
     if rows.is_empty() {
         rows.push(ReportRow {
@@ -522,7 +533,7 @@ mod tests {
 
     #[test]
     fn renders_borderless_report() {
-        let mut stats = BTreeMap::new();
+        let mut stats = HashMap::new();
         stats.insert("rs".to_string(), ExtensionStats { files: 1, bytes: 7 });
         stats.insert("txt".to_string(), ExtensionStats { files: 2, bytes: 8 });
 
@@ -548,7 +559,7 @@ TOTAL            3    15 B    100.0%
 
     #[test]
     fn renders_empty_report() {
-        let stats = BTreeMap::new();
+        let stats = HashMap::new();
 
         let report = render_report(
             Path::new("/scan/dir"),
