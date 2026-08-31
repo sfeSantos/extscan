@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 fn main() -> io::Result<()> {
     let program_name = env::args()
@@ -25,9 +26,16 @@ fn main() -> io::Result<()> {
     };
 
     let directory = env::current_dir()?;
+    let start = Instant::now();
     let extension_stats = collect_extension_stats(&directory, config.include_sub_dir)?;
+    let duration = start.elapsed();
 
-    print_report(&directory, config.include_sub_dir, &extension_stats);
+    print_report(
+        &directory,
+        config.include_sub_dir,
+        duration,
+        &extension_stats,
+    );
 
     Ok(())
 }
@@ -76,10 +84,14 @@ fn collect_extension_stats(
     directory: &Path,
     include_sub_dir: bool,
 ) -> io::Result<BTreeMap<String, ExtensionStats>> {
+    // Only the root is fatal; unreadable entries below it are skipped with a
+    // warning during the scan.
+    fs::read_dir(directory).map(drop)?;
+
     let queue = ScanQueue::new(directory.to_path_buf());
     let worker_count = thread::available_parallelism().map_or(1, usize::from);
 
-    let worker_results: Vec<io::Result<HashMap<String, ExtensionStats>>> = thread::scope(|scope| {
+    let worker_results: Vec<HashMap<String, ExtensionStats>> = thread::scope(|scope| {
         let workers: Vec<_> = (0..worker_count)
             .map(|_| scope.spawn(|| scan_worker(&queue, include_sub_dir)))
             .collect();
@@ -92,7 +104,7 @@ fn collect_extension_stats(
 
     let mut extension_stats = BTreeMap::new();
     for worker_stats in worker_results {
-        for (extension, stats) in worker_stats? {
+        for (extension, stats) in worker_stats {
             extension_stats
                 .entry(extension)
                 .or_insert_with(ExtensionStats::default)
@@ -117,7 +129,6 @@ struct ScanQueue {
 struct ScanState {
     directories: Vec<PathBuf>,
     pending: usize,
-    failed: bool,
 }
 
 impl ScanQueue {
@@ -126,19 +137,18 @@ impl ScanQueue {
             state: Mutex::new(ScanState {
                 directories: vec![root],
                 pending: 1,
-                failed: false,
             }),
             work_available: Condvar::new(),
         }
     }
 
     /// Blocks until a directory is available. Returns `None` when the scan is
-    /// complete or another worker reported an error.
+    /// complete.
     fn next_directory(&self) -> Option<PathBuf> {
         let mut state = self.state.lock().unwrap();
 
         loop {
-            if state.failed || state.pending == 0 {
+            if state.pending == 0 {
                 return None;
             }
 
@@ -165,31 +175,17 @@ impl ScanQueue {
             self.work_available.notify_all();
         }
     }
-
-    fn fail(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.failed = true;
-        self.work_available.notify_all();
-    }
 }
 
-fn scan_worker(
-    queue: &ScanQueue,
-    include_sub_dir: bool,
-) -> io::Result<HashMap<String, ExtensionStats>> {
+fn scan_worker(queue: &ScanQueue, include_sub_dir: bool) -> HashMap<String, ExtensionStats> {
     let mut extension_stats = HashMap::new();
 
     while let Some(directory) = queue.next_directory() {
-        let result = scan_directory(&directory, include_sub_dir, queue, &mut extension_stats);
+        scan_directory(&directory, include_sub_dir, queue, &mut extension_stats);
         queue.finish_directory();
-
-        if let Err(error) = result {
-            queue.fail();
-            return Err(error);
-        }
     }
 
-    Ok(extension_stats)
+    extension_stats
 }
 
 fn scan_directory(
@@ -197,10 +193,20 @@ fn scan_directory(
     include_sub_dir: bool,
     queue: &ScanQueue,
     extension_stats: &mut HashMap<String, ExtensionStats>,
-) -> io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("warning: cannot read {}: {error}", directory.display());
+            return;
+        }
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
 
         if file_type.is_file() || file_type.is_symlink() {
@@ -209,13 +215,15 @@ fn scan_directory(
                 .map(|value| value.to_string_lossy().into_owned())
             {
                 if !extension.is_empty() {
-                    let metadata = fs::metadata(&path)?;
-
-                    if metadata.is_file() {
-                        extension_stats
-                            .entry(extension)
-                            .or_default()
-                            .add_file(metadata.len());
+                    // Fails for dangling symlinks and files removed mid-scan;
+                    // skip those instead of aborting.
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        if metadata.is_file() {
+                            extension_stats
+                                .entry(extension)
+                                .or_default()
+                                .add_file(metadata.len());
+                        }
                     }
                 }
             }
@@ -223,8 +231,6 @@ fn scan_directory(
             queue.push_directory(path);
         }
     }
-
-    Ok(())
 }
 
 struct ReportRow {
@@ -237,6 +243,7 @@ struct ReportRow {
 fn print_report(
     directory: &Path,
     include_sub_dir: bool,
+    duration: Duration,
     extension_stats: &BTreeMap<String, ExtensionStats>,
 ) {
     let total_files: usize = extension_stats.values().map(|stats| stats.files).sum();
@@ -305,6 +312,7 @@ fn print_report(
             "current directory only"
         }
     );
+    println!("Duration: {}", format_duration(duration));
     println!();
 
     println!("{separator}");
@@ -370,6 +378,14 @@ fn format_usage(bytes: u64, total_bytes: u64) -> String {
     }
 
     format!("{:.1}%", bytes as f64 * 100.0 / total_bytes as f64)
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() >= 1 {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -473,5 +489,38 @@ mod tests {
         let missing = env::temp_dir().join(format!("extscan-test-missing-{}", std::process::id()));
 
         assert!(collect_extension_stats(&missing, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_dangling_symlinks() {
+        let tree = TempTree::new("dangling");
+        tree.create_file("a.txt", 3);
+        std::os::unix::fs::symlink(tree.root.join("missing.so"), tree.root.join("broken.so"))
+            .unwrap();
+
+        let stats = collect_extension_stats(&tree.root, true).unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats["txt"].files, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counts_symlinks_to_existing_files() {
+        let tree = TempTree::new("valid-symlink");
+        tree.create_file("a.txt", 3);
+        std::os::unix::fs::symlink(tree.root.join("a.txt"), tree.root.join("link.txt")).unwrap();
+
+        let stats = collect_extension_stats(&tree.root, false).unwrap();
+
+        assert_eq!(stats["txt"].files, 2);
+        assert_eq!(stats["txt"].bytes, 6);
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(format_duration(Duration::from_millis(38)), "38ms");
+        assert_eq!(format_duration(Duration::from_millis(1240)), "1.24s");
     }
 }
