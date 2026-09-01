@@ -15,6 +15,7 @@ By default, it scans only the directory where the command is executed. Use `--in
 - Filters extensions by substring or glob pattern, from the command line or live inside the pager.
 - Shows a side summary panel (grand totals, top 3 extensions by size, filter state) when the terminal is wide enough.
 - Sorts extensions alphabetically and prints a running total row on every page.
+- Skips hidden files and directories (names starting with `.`) unless `--include-hidden` is given.
 - Ignores files without an extension.
 
 ## Requirements
@@ -109,12 +110,13 @@ When running from the source tree, the script compiles `main.rs` and installs th
 ## Usage
 
 ```text
-extscan [--include-sub-dir] [--no-pager] [--filter <term>]
+extscan [--include-sub-dir] [--include-hidden] [--no-pager] [--filter <term>]
 ```
 
 | Flag | Effect |
 |---|---|
 | `--include-sub-dir` | Scan subdirectories too, not just the current directory. |
+| `--include-hidden` | Also count hidden files and descend into hidden directories. By default anything whose name starts with `.` is skipped. |
 | `--no-pager` | Print the whole report at once, even when it is long. |
 | `--filter <term>` | Show only extensions matching the term (see Filtering below). |
 
