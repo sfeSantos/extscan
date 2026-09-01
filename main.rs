@@ -22,7 +22,7 @@ fn main() -> io::Result<()> {
         Err(message) => {
             eprintln!("{message}");
             eprintln!(
-                "Usage: {} [--include-sub-dir] [--no-pager] [--filter <term>]",
+                "Usage: {} [--include-sub-dir] [--include-hidden] [--no-pager] [--filter <term>]",
                 program_name
             );
             std::process::exit(1);
@@ -31,7 +31,8 @@ fn main() -> io::Result<()> {
 
     let directory = env::current_dir()?;
     let start = Instant::now();
-    let extension_stats = collect_extension_stats(&directory, config.include_sub_dir)?;
+    let extension_stats =
+        collect_extension_stats(&directory, config.include_sub_dir, config.include_hidden)?;
     let duration = start.elapsed();
 
     print_report(&directory, &config, duration, &extension_stats);
@@ -41,6 +42,7 @@ fn main() -> io::Result<()> {
 
 struct Config {
     include_sub_dir: bool,
+    include_hidden: bool,
     no_pager: bool,
     filter: Option<String>,
 }
@@ -49,12 +51,15 @@ impl Config {
     fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut args = args;
         let mut include_sub_dir = false;
+        let mut include_hidden = false;
         let mut no_pager = false;
         let mut filter = None;
 
         while let Some(arg) = args.next() {
             if arg == "--include-sub-dir" {
                 include_sub_dir = true;
+            } else if arg == "--include-hidden" {
+                include_hidden = true;
             } else if arg == "--no-pager" {
                 no_pager = true;
             } else if arg == "--filter" {
@@ -71,6 +76,7 @@ impl Config {
 
         Ok(Self {
             include_sub_dir,
+            include_hidden,
             no_pager,
             filter,
         })
@@ -98,6 +104,7 @@ impl ExtensionStats {
 fn collect_extension_stats(
     directory: &Path,
     include_sub_dir: bool,
+    include_hidden: bool,
 ) -> io::Result<HashMap<String, ExtensionStats>> {
     // Only the root is fatal; unreadable entries below it are skipped with a
     // warning during the scan.
@@ -108,7 +115,7 @@ fn collect_extension_stats(
 
     let worker_results: Vec<HashMap<String, ExtensionStats>> = thread::scope(|scope| {
         let workers: Vec<_> = (0..worker_count)
-            .map(|_| scope.spawn(|| scan_worker(&queue, include_sub_dir)))
+            .map(|_| scope.spawn(|| scan_worker(&queue, include_sub_dir, include_hidden)))
             .collect();
 
         workers
@@ -192,20 +199,36 @@ impl ScanQueue {
     }
 }
 
-fn scan_worker(queue: &ScanQueue, include_sub_dir: bool) -> HashMap<String, ExtensionStats> {
+fn scan_worker(
+    queue: &ScanQueue,
+    include_sub_dir: bool,
+    include_hidden: bool,
+) -> HashMap<String, ExtensionStats> {
     let mut extension_stats = HashMap::new();
 
     while let Some(directory) = queue.next_directory() {
-        scan_directory(&directory, include_sub_dir, queue, &mut extension_stats);
+        scan_directory(
+            &directory,
+            include_sub_dir,
+            include_hidden,
+            queue,
+            &mut extension_stats,
+        );
         queue.finish_directory();
     }
 
     extension_stats
 }
 
+/// Hidden by the Unix convention: the name starts with a dot.
+fn is_hidden(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
+}
+
 fn scan_directory(
     directory: &Path,
     include_sub_dir: bool,
+    include_hidden: bool,
     queue: &ScanQueue,
     extension_stats: &mut HashMap<String, ExtensionStats>,
 ) {
@@ -227,6 +250,11 @@ fn scan_directory(
             // Only the name is needed for the extension; building the full
             // entry path here would allocate once per file for nothing.
             let file_name = entry.file_name();
+
+            if !include_hidden && is_hidden(&file_name) {
+                continue;
+            }
+
             let Some(extension) = Path::new(&file_name).extension() else {
                 continue;
             };
@@ -262,6 +290,10 @@ fn scan_directory(
                 }
             }
         } else if include_sub_dir && file_type.is_dir() {
+            if !include_hidden && is_hidden(&entry.file_name()) {
+                continue;
+            }
+
             queue.push_directory(entry.path());
         }
     }
@@ -996,7 +1028,7 @@ mod tests {
         tree.create_file("c.rs", 7);
         tree.create_file("sub/d.txt", 11);
 
-        let stats = collect_extension_stats(&tree.root, false).unwrap();
+        let stats = collect_extension_stats(&tree.root, false, false).unwrap();
 
         assert_eq!(stats.len(), 2);
         assert_eq!(stats["txt"].files, 2);
@@ -1013,7 +1045,7 @@ mod tests {
         tree.create_file("sub/deeper/c.txt", 11);
         tree.create_file("sub/deeper/d.rs", 7);
 
-        let stats = collect_extension_stats(&tree.root, true).unwrap();
+        let stats = collect_extension_stats(&tree.root, true, false).unwrap();
 
         assert_eq!(stats.len(), 2);
         assert_eq!(stats["txt"].files, 3);
@@ -1023,13 +1055,45 @@ mod tests {
     }
 
     #[test]
+    fn skips_hidden_entries_by_default() {
+        let tree = TempTree::new("hidden-skipped");
+        tree.create_file("a.txt", 3);
+        tree.create_file(".secret.txt", 5);
+        tree.create_file(".git/objects/b.sample", 7);
+        tree.create_file("sub/c.rs", 11);
+
+        let stats = collect_extension_stats(&tree.root, true, false).unwrap();
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats["txt"].files, 1);
+        assert_eq!(stats["txt"].bytes, 3);
+        assert_eq!(stats["rs"].files, 1);
+    }
+
+    #[test]
+    fn counts_hidden_entries_when_enabled() {
+        let tree = TempTree::new("hidden-included");
+        tree.create_file("a.txt", 3);
+        tree.create_file(".secret.txt", 5);
+        tree.create_file(".git/objects/b.sample", 7);
+
+        let stats = collect_extension_stats(&tree.root, true, true).unwrap();
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats["txt"].files, 2);
+        assert_eq!(stats["txt"].bytes, 8);
+        assert_eq!(stats["sample"].files, 1);
+        assert_eq!(stats["sample"].bytes, 7);
+    }
+
+    #[test]
     fn ignores_files_without_extension() {
         let tree = TempTree::new("no-extension");
         tree.create_file("README", 3);
         tree.create_file(".gitignore", 5);
         tree.create_file("a.txt", 7);
 
-        let stats = collect_extension_stats(&tree.root, true).unwrap();
+        let stats = collect_extension_stats(&tree.root, true, false).unwrap();
 
         assert_eq!(stats.len(), 1);
         assert_eq!(stats["txt"].files, 1);
@@ -1039,7 +1103,7 @@ mod tests {
     fn fails_on_missing_directory() {
         let missing = env::temp_dir().join(format!("extscan-test-missing-{}", std::process::id()));
 
-        assert!(collect_extension_stats(&missing, true).is_err());
+        assert!(collect_extension_stats(&missing, true, false).is_err());
     }
 
     #[cfg(unix)]
@@ -1050,7 +1114,7 @@ mod tests {
         std::os::unix::fs::symlink(tree.root.join("missing.so"), tree.root.join("broken.so"))
             .unwrap();
 
-        let stats = collect_extension_stats(&tree.root, true).unwrap();
+        let stats = collect_extension_stats(&tree.root, true, false).unwrap();
 
         assert_eq!(stats.len(), 1);
         assert_eq!(stats["txt"].files, 1);
@@ -1063,7 +1127,7 @@ mod tests {
         tree.create_file("a.txt", 3);
         std::os::unix::fs::symlink(tree.root.join("a.txt"), tree.root.join("link.txt")).unwrap();
 
-        let stats = collect_extension_stats(&tree.root, false).unwrap();
+        let stats = collect_extension_stats(&tree.root, false, false).unwrap();
 
         assert_eq!(stats["txt"].files, 2);
         assert_eq!(stats["txt"].bytes, 6);
