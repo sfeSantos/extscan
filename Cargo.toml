@@ -8,3 +8,7 @@ description = "A small CLI tool that reports file counts and size usage by exten
 [[bin]]
 name = "extscan"
 path = "main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
